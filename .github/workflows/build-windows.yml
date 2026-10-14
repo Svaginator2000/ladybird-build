@@ -1,0 +1,177 @@
+name: Build Ladybird (Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Ladybird ref (branch, tag or commit SHA)'
+        default: 'master'
+        required: true
+
+env:
+  LADYBIRD_REPO: https://github.com/LadybirdBrowser/ladybird.git
+  BUILD_PRESET: Release
+  CCACHE_MAXSIZE: 5G
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  # Phase 1: third-party dependencies (vcpkg: Qt, Skia, ANGLE, FFmpeg, ICU, ...).
+  # Binary packages land in Build/caches/vcpkg-binary-cache and are saved even on failure/timeout,
+  # so re-running the workflow resumes instead of starting over.
+  deps:
+    runs-on: windows-2025
+    timeout-minutes: 360
+    env:
+      LB_REF: ${{ inputs.ref }}
+    outputs:
+      sha: ${{ steps.src.outputs.sha }}
+    steps:
+      - &src
+        name: Fetch Ladybird sources
+        id: src
+        run: |
+          git config --global core.longpaths true
+          $root = (Split-Path -Qualifier $env:GITHUB_WORKSPACE) + '\lb'
+          git init -q $root
+          git -C $root remote add origin $env:LADYBIRD_REPO
+          git -C $root fetch -q --depth 1 origin $env:LB_REF
+          git -C $root checkout -q FETCH_HEAD
+          $sha = git -C $root rev-parse HEAD
+          "LADYBIRD_SOURCE_DIR=$root" >> $env:GITHUB_ENV
+          "CCACHE_DIR=$root\.ccache" >> $env:GITHUB_ENV
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "vcpkg_hash=$((Get-FileHash "$root\vcpkg.json").Hash)" >> $env:GITHUB_OUTPUT
+          Write-Host "Ladybird $sha"
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB)}}
+
+      - &python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - &tools
+        name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml requests six cryptography
+          choco install -y --no-progress pkgconfiglite ninja ccache
+          if (-not (Get-Command clang-cl -ErrorAction SilentlyContinue)) {
+            choco install -y --no-progress llvm
+            'C:\Program Files\LLVM\bin' >> $env:GITHUB_PATH
+          }
+
+      - &msvc
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - &versions
+        name: Tool versions
+        run: |
+          clang-cl --version
+          cmake --version
+          ninja --version
+          rustup --version
+          Get-Command cmake, ninja, clang-cl, pkg-config | Format-Table Name, Source
+
+      - &vcpkg_restore
+        name: Restore vcpkg binary cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.LADYBIRD_SOURCE_DIR }}\Build\caches\vcpkg-binary-cache
+          key: vcpkg-win-x64-release-${{ steps.src.outputs.vcpkg_hash }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            vcpkg-win-x64-release-${{ steps.src.outputs.vcpkg_hash }}-
+            vcpkg-win-x64-release-
+
+      - &bootstrap
+        name: Bootstrap vcpkg
+        working-directory: ${{ env.LADYBIRD_SOURCE_DIR }}
+        run: python Meta/ladybird.py vcpkg --preset $env:BUILD_PRESET
+
+      - name: Build dependencies (vcpkg install via CMake configure)
+        working-directory: ${{ env.LADYBIRD_SOURCE_DIR }}
+        timeout-minutes: 330
+        run: cmake --preset $env:BUILD_PRESET -DENABLE_CI_BASELINE_CPU=ON -DENABLE_LTO_FOR_RELEASE=OFF -DBUILD_TESTING=OFF
+
+      - name: Upload vcpkg logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vcpkg-logs
+          path: |
+            ${{ env.LADYBIRD_SOURCE_DIR }}\Build\release\vcpkg-manifest-install.log
+            ${{ env.LADYBIRD_SOURCE_DIR }}\Build\vcpkg-release\buildtrees\**\*.log
+          if-no-files-found: ignore
+
+      - name: Save vcpkg binary cache
+        if: always() && steps.src.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.LADYBIRD_SOURCE_DIR }}\Build\caches\vcpkg-binary-cache
+          key: vcpkg-win-x64-release-${{ steps.src.outputs.vcpkg_hash }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+  # Phase 2: Ladybird itself. Deps come from the binary cache; ccache is saved even on timeout.
+  build:
+    needs: deps
+    runs-on: windows-2025
+    timeout-minutes: 360
+    env:
+      LB_REF: ${{ needs.deps.outputs.sha }}
+    steps:
+      - *src
+      - *python
+      - *tools
+      - *msvc
+      - *versions
+      - *vcpkg_restore
+      - *bootstrap
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.LADYBIRD_SOURCE_DIR }}\.ccache
+          key: ccache-win-x64-release-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ccache-win-x64-release-
+
+      - name: Configure
+        working-directory: ${{ env.LADYBIRD_SOURCE_DIR }}
+        timeout-minutes: 120
+        run: cmake --preset $env:BUILD_PRESET -DENABLE_CI_BASELINE_CPU=ON -DENABLE_LTO_FOR_RELEASE=OFF -DBUILD_TESTING=OFF
+
+      - name: Build
+        working-directory: ${{ env.LADYBIRD_SOURCE_DIR }}
+        timeout-minutes: 300
+        run: |
+          ccache -z
+          cmake --build --preset $env:BUILD_PRESET
+          ccache -s
+
+      - name: Save ccache
+        if: always() && steps.src.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.LADYBIRD_SOURCE_DIR }}\.ccache
+          key: ccache-win-x64-release-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Package
+        working-directory: ${{ env.LADYBIRD_SOURCE_DIR }}\Build\release
+        run: |
+          $out = "$env:RUNNER_TEMP\Ladybird"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          robocopy bin "$out\bin" /E /XF *.pdb *.ilk *.lib *.exp /NFL /NDL /NJH /NJS
+          if (Test-Path share) { robocopy share "$out\share" /E /NFL /NDL /NJH /NJS }
+          if ($LASTEXITCODE -ge 8) { exit $LASTEXITCODE }
+          Get-ChildItem "$out\bin" -Filter *.exe | Format-Table Name, Length
+          if (-not (Test-Path "$out\bin\Ladybird.exe")) { throw 'Ladybird.exe missing' }
+          exit 0
+
+      - name: Upload Ladybird
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ladybird-windows-x64-${{ steps.src.outputs.sha }}
+          path: ${{ runner.temp }}\Ladybird
+          if-no-files-found: error
